@@ -1,120 +1,148 @@
-
 const express = require('express');
 const router = express.Router();
 const multer = require('multer');
 const csv = require('csv-parser');
 const fs = require('fs');
+const path = require('path');
 const Stock = require('../../models/Stock');
 const auth = require('../../middleware/auth');
 
-// Set up multer for file uploads
-const upload = multer({ dest: 'uploads/' });
-
-// @route   GET api/stocks
-// @desc    Get all stocks
-// @access  Public
-router.get('/', async (req, res) => {
-  try {
-    const stocks = await Stock.find();
-    res.json(stocks);
-  } catch (err) {
-    console.error(err.message);
-    res.status(500).send('Server Error');
-  }
+// Middleware debug log
+router.use((req, res, next) => {
+  console.log('📦 Stock API route triggered');
+  next();
 });
 
-// @route   GET api/stocks/:symbol
-// @desc    Get stock by symbol
-// @access  Public
-router.get('/:symbol', async (req, res) => {
-  try {
-    const stock = await Stock.findOne({ symbol: req.params.symbol });
-    
-    if (!stock) {
-      return res.status(404).json({ msg: 'Stock not found' });
-    }
-    
-    res.json(stock);
-  } catch (err) {
-    console.error(err.message);
-    res.status(500).send('Server Error');
-  }
-});
+// Apply auth middleware to all routes in this file
+router.use(auth);
 
-// @route   POST api/stocks/upload
-// @desc    Upload and process CSV file
-// @access  Private
-router.post('/upload', auth, upload.single('file'), async (req, res) => {
-  if (!req.file) {
-    return res.status(400).json({ msg: 'No file uploaded' });
-  }
-  
-  const results = [];
-  
-  fs.createReadStream(req.file.path)
-    .pipe(csv())
-    .on('data', (data) => results.push(data))
-    .on('end', async () => {
-      try {
-        // Process the CSV data
-        const processedData = processStockData(results);
-        
-        // Save to database - using upsert to update existing or create new
-        for (const stock of processedData) {
-          await Stock.findOneAndUpdate(
-            { symbol: stock.symbol },
-            stock,
-            { upsert: true, new: true }
-          );
-        }
-        
-        // Delete the uploaded file
-        fs.unlinkSync(req.file.path);
-        
-        res.json({ msg: 'Stock data uploaded successfully', count: processedData.length });
-      } catch (err) {
-        console.error(err.message);
-        res.status(500).send('Server Error');
+// Configure multer for file upload
+const upload = multer({
+  storage: multer.diskStorage({
+    destination: (req, file, cb) => {
+      const uploadDir = path.join(__dirname, '../../uploads');
+      if (!fs.existsSync(uploadDir)) {
+        fs.mkdirSync(uploadDir);
       }
-    });
+      cb(null, uploadDir);
+    },
+    filename: (req, file, cb) => {
+      cb(null, `${Date.now()}-${file.originalname}`);
+    }
+  }),
+  fileFilter: (req, file, cb) => {
+    if (file.mimetype === 'text/csv' || file.originalname.endsWith('.csv') || file.originalname.endsWith('.txt')) {
+      cb(null, true);
+    } else {
+      cb(new Error('Only CSV and TXT files are allowed'), false);
+    }
+  }
 });
 
-// Helper function to process CSV data
+// @route   POST /api/stock/upload
+// @desc    Upload stock data (CSV)
+// @access  Private (Authenticated)
+router.post('/upload', upload.single('file'), async (req, res) => {
+  console.log('📁 File Upload Received:', req.file);
+
+  if (!req.file) {
+    return res.status(400).json({ 
+      msg: 'No file uploaded',
+      error: 'File upload failed' 
+    });
+  }
+
+  const results = [];
+  const filePath = req.file.path;
+
+  try {
+    await new Promise((resolve, reject) => {
+      fs.createReadStream(filePath)
+        .pipe(csv({
+          separator: ',',
+          headers: ['Date', 'series', 'OPEN', 'HIGH', 'LOW', 'PREV. CLOSE', 'ltp', 'close', 'vwap', '52W H', '52W L', 'VOLUME', 'VALUE', 'No of trades'],
+          strict: true,
+          skipLines: 1
+        }))
+        .on('data', (data) => {
+          if (data.OPEN && data.close) {
+            results.push(data);
+          }
+        })
+        .on('end', () => resolve())
+        .on('error', (err) => reject(err));
+    });
+
+    const processedData = processStockData(results);
+    const savedStocks = [];
+
+    for (const stock of processedData) {
+      const savedStock = await Stock.findOneAndUpdate(
+        { symbol: stock.symbol },
+        stock,
+        { upsert: true, new: true }
+      );
+      savedStocks.push(savedStock);
+    }
+
+    fs.unlinkSync(filePath);
+
+    res.status(200).json({ 
+      msg: 'Stock data uploaded successfully', 
+      count: processedData.length,
+      details: savedStocks
+    });
+
+  } catch (err) {
+    console.error('❌ Upload Error:', err);
+    if (fs.existsSync(filePath)) {
+      fs.unlinkSync(filePath);
+    }
+    res.status(500).json({ 
+      msg: 'Upload failed', 
+      error: err.message || 'Unexpected server error'
+    });
+  }
+});
+
 function processStockData(csvData) {
-  const stockMap = {};
-  
-  csvData.forEach(row => {
-    const symbol = row.symbol || '';
-    if (!symbol) return;
-    
-    // Initialize stock if it doesn't exist
-    if (!stockMap[symbol]) {
-      stockMap[symbol] = {
-        symbol,
-        name: row.name || '',
-        price: parseFloat(row.price) || 0,
-        change: parseFloat(row.change) || 0,
-        changePercent: parseFloat(row.changePercent) || 0,
-        sector: row.sector || 'Unknown',
-        marketCap: parseFloat(row.marketCap) || 0,
-        prices: []
-      };
-    }
-    
-    // Add price data if available
-    if (row.date) {
-      stockMap[symbol].prices.push({
-        date: row.date,
-        open: parseFloat(row.open) || 0,
-        high: parseFloat(row.high) || 0,
+  try {
+    const stockMap = {};
+    const defaultSymbol = 'EQ';
+    const defaultName = 'Equity Stock';
+
+    csvData.forEach((row, index) => {
+      if (!row.OPEN) return;
+
+      if (!stockMap[defaultSymbol]) {
+        stockMap[defaultSymbol] = {
+          symbol: defaultSymbol,
+          name: defaultName,
+          price: parseFloat(row.close) || 0,
+          change: parseFloat(row.close) - parseFloat(row['PREV. CLOSE']) || 0,
+          changePercent: ((parseFloat(row.close) - parseFloat(row['PREV. CLOSE'])) / parseFloat(row['PREV. CLOSE']) * 100) || 0,
+          sector: 'Equity',
+          marketCap: 0,
+          prices: []
+        };
+      }
+
+      const cleanVolume = row.VOLUME.replace(/[^\d]/g, '');
+      stockMap[defaultSymbol].prices.push({
+        date: row.Date || new Date().toISOString().split('T')[0],
+        open: parseFloat(row.OPEN) || 0,
+        high: parseFloat(row.HIGH) || 0,
         close: parseFloat(row.close) || 0,
-        low: parseFloat(row.low) || 0,
-        volume: parseInt(row.volume) || 0
+        low: parseFloat(row.LOW) || 0,
+        volume: parseInt(cleanVolume) || 0
       });
-    }
-  });
-  
-  return Object.values(stockMap);
+    });
+
+    return Object.values(stockMap);
+  } catch (error) {
+    console.error('❌ Process Stock Data Error:', error);
+    throw error;
+  }
 }
 
 module.exports = router;

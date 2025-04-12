@@ -1,38 +1,36 @@
-
 const express = require('express');
 const connectDB = require('./config/db');
 const cors = require('cors');
+const fs = require('fs');
 const path = require('path');
 
 const app = express();
 
-// Connect to Database
+// Connect Database
 connectDB();
 
-// Init Middleware
-app.use(express.json({ extended: false }));
+// Middleware
+app.use(express.json());
 app.use(cors());
 
-// Define Routes
+// Routes
 app.use('/api/stocks', require('./routes/api/stocks'));
 app.use('/api/users', require('./routes/api/users'));
 
-// Create uploads directory if it doesn't exist
-const fs = require('fs');
-if (!fs.existsSync('./uploads')) {
-  fs.mkdirSync('./uploads');
+// Ensure uploads directory exists
+const uploadDir = path.join(__dirname, 'uploads');
+if (!fs.existsSync(uploadDir)) {
+  fs.mkdirSync(uploadDir);
 }
 
-// Serve static assets in production
+// Serve static files in production
 if (process.env.NODE_ENV === 'production') {
-  // Set static folder
-  app.use(express.static('client/build'));
+  app.use(express.static(path.join(__dirname, 'client', 'build')));
 
-  app.get('*', (req, res) => {
-    res.sendFile(path.resolve(__dirname, 'client', 'build', 'index.html'));
-  });
+  app.get('*', (req, res) =>
+    res.sendFile(path.join(__dirname, 'client', 'build', 'index.html'))
+  );
 }
 
 const PORT = process.env.PORT || 5000;
-
 app.listen(PORT, () => console.log(`Server started on port ${PORT}`));
