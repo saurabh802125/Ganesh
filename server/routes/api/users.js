@@ -2,201 +2,285 @@ const express = require('express');
 const router = express.Router();
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
+const crypto = require('crypto');
+
 const User = require('../../models/User');
 const Stock = require('../../models/Stock');
 const auth = require('../../middleware/auth');
 
-// JWT Secret - should be kept in environment variables in production
-const JWT_SECRET = process.env.JWT_SECRET || 'stockvision-secret';
+// JWT Configuration
+const JWT_SECRET = process.env.JWT_SECRET || 'your_jwt_secret';
+const JWT_EXPIRATION = '5d'; // 5 days
+
+// Utility function to generate JWT token
+const generateToken = (user) => {
+  return jwt.sign(
+    { 
+      id: user._id,
+      email: user.email 
+    },
+    JWT_SECRET,
+    { expiresIn: JWT_EXPIRATION }
+  );
+};
 
 // @route   POST api/users/register
-// @desc    Register user
+// @desc    Register new user
 // @access  Public
 router.post('/register', async (req, res) => {
   const { name, email, password } = req.body;
 
   try {
-    // Check if user exists
-    let user = await User.findOne({ email });
-
-    if (user) {
+    // Check if user already exists
+    let existingUser = await User.findOne({ email: email.toLowerCase() });
+    if (existingUser) {
       return res.status(400).json({ msg: 'User already exists' });
     }
 
-    user = new User({
+    // Create new user
+    const user = new User({
       name,
-      email,
-      password
+      email: email.toLowerCase(),
+      password,
+      preferences: {
+        notifications: {
+          email: true,
+          sms: false,
+          pushNotifications: false
+        },
+        theme: 'system',
+        language: 'en'
+      }
     });
 
-    // Encrypt password
-    const salt = await bcrypt.genSalt(10);
-    user.password = await bcrypt.hash(password, salt);
+    // Generate email verification token
+    const verificationToken = crypto.randomBytes(20).toString('hex');
+    user.emailVerificationToken = verificationToken;
+    user.emailVerificationExpiry = Date.now() + 24 * 3600000; // 24 hours
 
+    // Save user
     await user.save();
 
-    // Create JWT payload
-    const payload = {
-      user: {
-        id: user.id
-      }
-    };
+    // Generate JWT token
+    const token = generateToken(user);
 
-    // Sign the token
-    jwt.sign(
-      payload,
-      JWT_SECRET,
-      { expiresIn: '5 days' },
-      (err, token) => {
-        if (err) throw err;
-        res.json({ token });
+    // TODO: Send verification email (implementation depends on your email service)
+    console.log(`Verification Token: ${verificationToken}`);
+
+    res.status(201).json({
+      token,
+      user: {
+        id: user._id,
+        name: user.name,
+        email: user.email,
+        isEmailVerified: false
       }
-    );
+    });
   } catch (err) {
-    console.error(err.message);
-    res.status(500).send('Server error');
+    console.error('Registration error:', err);
+    res.status(500).json({ msg: 'Server error during registration' });
   }
 });
 
 // @route   POST api/users/login
-// @desc    Authenticate user & get token
+// @desc    Authenticate user
 // @access  Public
 router.post('/login', async (req, res) => {
   const { email, password } = req.body;
 
   try {
-    // Check if user exists
-    const user = await User.findOne({ email });
-
+    // Find user by email
+    const user = await User.findOne({ email: email.toLowerCase() });
     if (!user) {
-      return res.status(400).json({ msg: 'Invalid Credentials' });
+      return res.status(400).json({ msg: 'Invalid credentials' });
     }
 
     // Check password
     const isMatch = await bcrypt.compare(password, user.password);
-
     if (!isMatch) {
-      return res.status(400).json({ msg: 'Invalid Credentials' });
+      return res.status(400).json({ msg: 'Invalid credentials' });
     }
 
-    // Create JWT payload
-    const payload = {
-      user: {
-        id: user.id
-      }
-    };
+    // Check if account is active
+    if (!user.isActive) {
+      return res.status(403).json({ msg: 'Account is suspended' });
+    }
 
-    // Sign the token
-    jwt.sign(
-      payload,
-      JWT_SECRET,
-      { expiresIn: '5 days' },
-      (err, token) => {
-        if (err) throw err;
-        res.json({ token });
+    // Update last login
+    user.lastLogin = new Date();
+    await user.save();
+
+    // Generate JWT token
+    const token = generateToken(user);
+
+    res.json({
+      token,
+      user: {
+        id: user._id,
+        name: user.name,
+        email: user.email,
+        isEmailVerified: user.isEmailVerified,
+        preferences: user.preferences
       }
-    );
+    });
   } catch (err) {
-    console.error(err.message);
-    res.status(500).send('Server error');
+    console.error('Login error:', err);
+    res.status(500).json({ msg: 'Server error during login' });
   }
 });
 
 // @route   GET api/users/me
-// @desc    Get current user
+// @desc    Get current user profile
 // @access  Private
 router.get('/me', auth, async (req, res) => {
   try {
-    const user = await User.findById(req.user.id).select('-password');
+    const user = await User.findById(req.user.id)
+      .select('-password')
+      .populate({
+        path: 'watchlist',
+        select: 'symbol name price change changePercent'
+      })
+      .populate({
+        path: 'portfolios.stocks.stock',
+        select: 'symbol name price'
+      });
+
+    if (!user) {
+      return res.status(404).json({ msg: 'User not found' });
+    }
+
     res.json(user);
   } catch (err) {
-    console.error(err.message);
-    res.status(500).send('Server Error');
+    console.error('Get profile error:', err);
+    res.status(500).json({ msg: 'Server error fetching profile' });
   }
 });
 
-// @route   PUT api/users/watchlist
-// @desc    Add stock to watchlist
+// @route   PUT api/users/preferences
+// @desc    Update user preferences
 // @access  Private
-router.put('/watchlist', auth, async (req, res) => {
+router.put('/preferences', auth, async (req, res) => {
   try {
-    const { symbol } = req.body;
-    
-    if (!symbol) {
-      return res.status(400).json({ msg: 'Symbol is required' });
-    }
-    
-    // Find the stock first
-    const stock = await Stock.findOne({ symbol });
-    if (!stock) {
-      return res.status(404).json({ msg: 'Stock not found' });
-    }
-    
     const user = await User.findById(req.user.id);
-    
-    // Check if stock is already in watchlist
-    if (user.watchlist.some(id => id.equals(stock._id))) {
-      return res.status(400).json({ msg: 'Stock already in watchlist' });
+
+    if (!user) {
+      return res.status(404).json({ msg: 'User not found' });
     }
-    
-    // Add to user's watchlist
-    user.watchlist.push(stock._id);
+
+    // Update preferences
+    if (req.body.notifications) {
+      user.preferences.notifications = {
+        ...user.preferences.notifications,
+        ...req.body.notifications
+      };
+    }
+
+    if (req.body.theme) {
+      user.preferences.theme = req.body.theme;
+    }
+
+    if (req.body.language) {
+      user.preferences.language = req.body.language;
+    }
+
     await user.save();
-    
-    // Add user to stock's usersWatching
-    if (!stock.usersWatching.some(id => id.equals(user._id))) {
-      stock.usersWatching.push(user._id);
-      await stock.save();
-    }
-    
-    // Populate the watchlist with stock data before returning
-    const populatedUser = await User.findById(user._id).populate('watchlist');
-    res.json(populatedUser.watchlist);
+
+    res.json({
+      preferences: user.preferences
+    });
   } catch (err) {
-    console.error(err.message);
-    res.status(500).send('Server Error');
+    console.error('Update preferences error:', err);
+    res.status(500).json({ msg: 'Server error updating preferences' });
   }
 });
 
-// @route   DELETE api/users/watchlist/:symbol
-// @desc    Remove stock from watchlist
-// @access  Private
-router.delete('/watchlist/:symbol', auth, async (req, res) => {
+// @route   POST api/users/verify-email
+// @desc    Verify email
+// @access  Public
+router.post('/verify-email', async (req, res) => {
+  const { token } = req.body;
+
   try {
-    const stock = await Stock.findOne({ symbol: req.params.symbol });
-    if (!stock) {
-      return res.status(404).json({ msg: 'Stock not found' });
+    const user = await User.findOne({
+      emailVerificationToken: token,
+      emailVerificationExpiry: { $gt: Date.now() }
+    });
+
+    if (!user) {
+      return res.status(400).json({ msg: 'Invalid or expired verification token' });
     }
-    
-    const user = await User.findById(req.user.id);
-    
-    // Remove the stock from user's watchlist
-    user.watchlist = user.watchlist.filter(id => !id.equals(stock._id));
+
+    // Mark email as verified
+    user.isEmailVerified = true;
+    user.emailVerificationToken = undefined;
+    user.emailVerificationExpiry = undefined;
+
     await user.save();
-    
-    // Remove user from stock's usersWatching
-    stock.usersWatching = stock.usersWatching.filter(id => !id.equals(user._id));
-    await stock.save();
-    
-    // Populate the watchlist with stock data before returning
-    const populatedUser = await User.findById(user._id).populate('watchlist');
-    res.json(populatedUser.watchlist);
+
+    res.json({ msg: 'Email verified successfully' });
   } catch (err) {
-    console.error(err.message);
-    res.status(500).send('Server Error');
+    console.error('Email verification error:', err);
+    res.status(500).json({ msg: 'Server error verifying email' });
   }
 });
 
-// @route   GET api/users/watchlist
-// @desc    Get user's watchlist with full stock data
-// @access  Private
-router.get('/watchlist', auth, async (req, res) => {
+// @route   POST api/users/reset-password
+// @desc    Request password reset
+// @access  Public
+router.post('/reset-password', async (req, res) => {
+  const { email } = req.body;
+
   try {
-    const user = await User.findById(req.user.id).populate('watchlist');
-    res.json(user.watchlist);
+    const user = await User.findOne({ email: email.toLowerCase() });
+
+    if (!user) {
+      return res.status(404).json({ msg: 'No account found with that email' });
+    }
+
+    // Generate reset token
+    const resetToken = crypto.randomBytes(20).toString('hex');
+    user.passwordResetToken = resetToken;
+    user.passwordResetExpiry = Date.now() + 3600000; // 1 hour
+
+    await user.save();
+
+    // TODO: Send password reset email
+    console.log(`Password Reset Token: ${resetToken}`);
+
+    res.json({ msg: 'Password reset link sent' });
   } catch (err) {
-    console.error(err.message);
-    res.status(500).send('Server Error');
+    console.error('Password reset request error:', err);
+    res.status(500).json({ msg: 'Server error processing reset request' });
+  }
+});
+
+// @route   POST api/users/reset-password/confirm
+// @desc    Confirm password reset
+// @access  Public
+router.post('/reset-password/confirm', async (req, res) => {
+  const { token, newPassword } = req.body;
+
+  try {
+    const user = await User.findOne({
+      passwordResetToken: token,
+      passwordResetExpiry: { $gt: Date.now() }
+    });
+
+    if (!user) {
+      return res.status(400).json({ msg: 'Invalid or expired reset token' });
+    }
+
+    // Set new password
+    user.password = newPassword;
+    user.passwordResetToken = undefined;
+    user.passwordResetExpiry = undefined;
+
+    await user.save();
+
+    res.json({ msg: 'Password reset successful' });
+  } catch (err) {
+    console.error('Password reset confirmation error:', err);
+    res.status(500).json({ msg: 'Server error resetting password' });
   }
 });
 
