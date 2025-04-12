@@ -105,37 +105,117 @@ router.post('/upload', upload.single('file'), async (req, res) => {
   }
 });
 
+// @route   GET /api/stock
+// @desc    Get all stocks with user watch status
+// @access  Private
+router.get('/', auth, async (req, res) => {
+  try {
+    const stocks = await Stock.find();
+    const user = await User.findById(req.user.id).populate('watchlist');
+    
+    const stocksWithWatchStatus = stocks.map(stock => ({
+      ...stock.toObject(),
+      isWatched: user.watchlist.some(watchedStock => watchedStock._id.equals(stock._id))
+    }));
+    
+    res.json(stocksWithWatchStatus);
+  } catch (err) {
+    console.error('❌ Get Stocks Error:', err);
+    res.status(500).json({ 
+      msg: 'Failed to get stocks', 
+      error: err.message || 'Unexpected server error'
+    });
+  }
+});
+
+// @route   GET /api/stock/:symbol
+// @desc    Get single stock with user watch status
+// @access  Private
+router.get('/:symbol', auth, async (req, res) => {
+  try {
+    const stock = await Stock.findOne({ symbol: req.params.symbol });
+    if (!stock) {
+      return res.status(404).json({ msg: 'Stock not found' });
+    }
+    
+    const user = await User.findById(req.user.id).populate('watchlist');
+    const stockWithWatchStatus = {
+      ...stock.toObject(),
+      isWatched: user.watchlist.some(watchedStock => watchedStock._id.equals(stock._id))
+    };
+    
+    res.json(stockWithWatchStatus);
+  } catch (err) {
+    console.error('❌ Get Stock Error:', err);
+    res.status(500).json({ 
+      msg: 'Failed to get stock', 
+      error: err.message || 'Unexpected server error'
+    });
+  }
+});
+
 function processStockData(csvData) {
   try {
     const stockMap = {};
-    const defaultSymbol = 'EQ';
-    const defaultName = 'Equity Stock';
-
-    csvData.forEach((row, index) => {
+    
+    csvData.forEach((row) => {
       if (!row.OPEN) return;
 
-      if (!stockMap[defaultSymbol]) {
-        stockMap[defaultSymbol] = {
-          symbol: defaultSymbol,
-          name: defaultName,
-          price: parseFloat(row.close) || 0,
-          change: parseFloat(row.close) - parseFloat(row['PREV. CLOSE']) || 0,
-          changePercent: ((parseFloat(row.close) - parseFloat(row['PREV. CLOSE'])) / parseFloat(row['PREV. CLOSE']) * 100) || 0,
-          sector: 'Equity',
-          marketCap: 0,
-          prices: []
+      // Helper function to clean and parse values
+      const cleanValue = (value) => {
+        if (typeof value === 'string') {
+          // Remove commas and convert to number
+          return parseFloat(value.replace(/,/g, '')) || 0;
+        }
+        return value || 0;
+      };
+
+      const symbol = row.series || 'EQ'; // Default to 'EQ' if series not specified
+      const stockName = `Stock ${symbol}`; // Default name - consider mapping to actual names
+
+      if (!stockMap[symbol]) {
+        stockMap[symbol] = {
+          symbol: symbol,
+          name: stockName,
+          price: cleanValue(row.close),
+          change: cleanValue(row.close) - cleanValue(row['PREV. CLOSE']),
+          changePercent: ((cleanValue(row.close) - cleanValue(row['PREV. CLOSE'])) / 
+                       cleanValue(row['PREV. CLOSE']) * 100),
+          sector: 'Equity', // Default sector
+          marketCap: cleanValue(row.VALUE), // Using VALUE as market cap proxy
+          prices: [],
+          usersWatching: []
         };
       }
 
-      const cleanVolume = row.VOLUME.replace(/[^\d]/g, '');
-      stockMap[defaultSymbol].prices.push({
-        date: row.Date || new Date().toISOString().split('T')[0],
-        open: parseFloat(row.OPEN) || 0,
-        high: parseFloat(row.HIGH) || 0,
-        close: parseFloat(row.close) || 0,
-        low: parseFloat(row.LOW) || 0,
-        volume: parseInt(cleanVolume) || 0
+      // Add price data point
+      stockMap[symbol].prices.push({
+        date: row.Date,
+        open: cleanValue(row.OPEN),
+        high: cleanValue(row.HIGH),
+        low: cleanValue(row.LOW),
+        close: cleanValue(row.close),
+        prevClose: cleanValue(row['PREV. CLOSE']),
+        ltp: cleanValue(row.ltp),
+        vwap: cleanValue(row.vwap),
+        week52High: cleanValue(row['52W H']),
+        week52Low: cleanValue(row['52W L']),
+        volume: cleanValue(row.VOLUME),
+        value: cleanValue(row.VALUE),
+        trades: cleanValue(row['No of trades'])
       });
+
+      // Keep prices sorted by date (newest first)
+      stockMap[symbol].prices.sort((a, b) => new Date(b.date) - new Date(a.date));
+      
+      // Update current price data from the most recent entry
+      const latestPrice = stockMap[symbol].prices[0];
+      if (latestPrice) {
+        stockMap[symbol].price = latestPrice.close;
+        stockMap[symbol].change = latestPrice.close - latestPrice.prevClose;
+        stockMap[symbol].changePercent = 
+          ((latestPrice.close - latestPrice.prevClose) / latestPrice.prevClose) * 100;
+      }
     });
 
     return Object.values(stockMap);

@@ -1,4 +1,3 @@
-
 const mongoose = require('mongoose');
 
 const UserSchema = new mongoose.Schema({
@@ -15,14 +14,16 @@ const UserSchema = new mongoose.Schema({
     type: String,
     required: true
   },
-  watchlist: {
-    type: [String],
-    default: []
-  },
+  watchlist: [{
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Stock'
+  }],
   date: {
     type: Date,
     default: Date.now
   }
 });
+
+UserSchema.index({ email: 1 }, { unique: true });
 
 module.exports = mongoose.model('User', UserSchema);

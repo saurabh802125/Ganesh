@@ -1,9 +1,9 @@
-
 const express = require('express');
 const router = express.Router();
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const User = require('../../models/User');
+const Stock = require('../../models/Stock');
 const auth = require('../../middleware/auth');
 
 // JWT Secret - should be kept in environment variables in production
@@ -126,17 +126,32 @@ router.put('/watchlist', auth, async (req, res) => {
       return res.status(400).json({ msg: 'Symbol is required' });
     }
     
+    // Find the stock first
+    const stock = await Stock.findOne({ symbol });
+    if (!stock) {
+      return res.status(404).json({ msg: 'Stock not found' });
+    }
+    
     const user = await User.findById(req.user.id);
     
     // Check if stock is already in watchlist
-    if (user.watchlist.includes(symbol)) {
+    if (user.watchlist.some(id => id.equals(stock._id))) {
       return res.status(400).json({ msg: 'Stock already in watchlist' });
     }
     
-    user.watchlist.push(symbol);
+    // Add to user's watchlist
+    user.watchlist.push(stock._id);
     await user.save();
     
-    res.json(user.watchlist);
+    // Add user to stock's usersWatching
+    if (!stock.usersWatching.some(id => id.equals(user._id))) {
+      stock.usersWatching.push(user._id);
+      await stock.save();
+    }
+    
+    // Populate the watchlist with stock data before returning
+    const populatedUser = await User.findById(user._id).populate('watchlist');
+    res.json(populatedUser.watchlist);
   } catch (err) {
     console.error(err.message);
     res.status(500).send('Server Error');
@@ -148,13 +163,24 @@ router.put('/watchlist', auth, async (req, res) => {
 // @access  Private
 router.delete('/watchlist/:symbol', auth, async (req, res) => {
   try {
+    const stock = await Stock.findOne({ symbol: req.params.symbol });
+    if (!stock) {
+      return res.status(404).json({ msg: 'Stock not found' });
+    }
+    
     const user = await User.findById(req.user.id);
     
-    // Remove the stock
-    user.watchlist = user.watchlist.filter(stock => stock !== req.params.symbol);
+    // Remove the stock from user's watchlist
+    user.watchlist = user.watchlist.filter(id => !id.equals(stock._id));
     await user.save();
     
-    res.json(user.watchlist);
+    // Remove user from stock's usersWatching
+    stock.usersWatching = stock.usersWatching.filter(id => !id.equals(user._id));
+    await stock.save();
+    
+    // Populate the watchlist with stock data before returning
+    const populatedUser = await User.findById(user._id).populate('watchlist');
+    res.json(populatedUser.watchlist);
   } catch (err) {
     console.error(err.message);
     res.status(500).send('Server Error');
@@ -162,11 +188,11 @@ router.delete('/watchlist/:symbol', auth, async (req, res) => {
 });
 
 // @route   GET api/users/watchlist
-// @desc    Get user's watchlist
+// @desc    Get user's watchlist with full stock data
 // @access  Private
 router.get('/watchlist', auth, async (req, res) => {
   try {
-    const user = await User.findById(req.user.id);
+    const user = await User.findById(req.user.id).populate('watchlist');
     res.json(user.watchlist);
   } catch (err) {
     console.error(err.message);

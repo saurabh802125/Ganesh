@@ -1,4 +1,3 @@
-
 const mongoose = require('mongoose');
 
 const StockPriceSchema = new mongoose.Schema({
@@ -18,7 +17,15 @@ const StockSchema = new mongoose.Schema({
   changePercent: { type: Number, required: true },
   sector: { type: String, required: true },
   marketCap: { type: Number, required: true },
-  prices: [StockPriceSchema]
+  prices: [StockPriceSchema],
+  usersWatching: [{
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'User'
+  }]
+}, {
+  timestamps: true
 });
+
+StockSchema.index({ symbol: 1 }, { unique: true });
 
 module.exports = mongoose.model('Stock', StockSchema);
